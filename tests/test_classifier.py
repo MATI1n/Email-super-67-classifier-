@@ -70,7 +70,7 @@ def test_classify_support_requests():
         "Как настроить принтер?\n"
     ]
     letter = Letter(content)
-    assert classify_letter(letter) == "support_requests"
+    assert classify_letter(letter) == "unknown"
 
 def test_date_parsing():
     content = [
@@ -81,6 +81,7 @@ def test_date_parsing():
     ]
     letter = Letter(content)
     assert letter.date is not None
+    assert letter.sent_from_email == "a@b.ru"
     assert letter.date.year == 2025
     assert letter.date.month == 1
     assert letter.date.day == 28

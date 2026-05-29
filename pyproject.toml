@@ -1,0 +1,11 @@
+[project]
+name = "tp-hack"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "dateparser>=1.4.0",
+    "joblib>=1.5.3",
+    "pytest>=9.0.3",
+    "tqdm>=4.67.3",
+]
