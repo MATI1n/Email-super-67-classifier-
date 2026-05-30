@@ -1,0 +1,6 @@
+From: Grafana <alerts@grafana.internal>
+To: admin@company.ru
+Subject: High CPU usage
+Date: 2026-05-30 10:00
+
+CPU is above 90% on server X.

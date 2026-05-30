@@ -1,7 +1,12 @@
 import re
+import dateparser
 from typing import List, Optional
 from email.utils import parseaddr
-import dateparser
+from typing import NamedTuple
+
+class Category(NamedTuple):
+    name: str
+    keywords: tuple[str, ...]
 
 
 class Letter:

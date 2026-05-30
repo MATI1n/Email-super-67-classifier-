@@ -2,39 +2,64 @@ import shutil
 import json
 import logging
 import argparse
+import os
+from dotenv import load_dotenv
 from os import listdir
 from collections import Counter
 from tqdm.contrib.concurrent import process_map
 from pathlib import Path
-from structures import Letter
+from structures import Letter, Category
 
 logging.basicConfig(
     filename='classifier.log',
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
 logger = logging.getLogger("main")
 
-INBOX_DIR = Path("inbox")
-PROCESSED_DIR = Path("processed")
-N_JOBS = 4
+load_dotenv()
 
-CATEGORIES = [
-    "urgent",
-    "alerts",
-    "spam",
-    "hr_documents",
-    "newsletters",
-    "unknown",
-    "errors"
+global_env = Path.home() / ".email-classifier.env"
+if global_env.exists():
+    load_dotenv(dotenv_path=global_env)
+
+DEFAULT_CATEGORIES = [
+    Category("spam", ("casino", "win", "discount", "скидк", "выигрыш", "реклама", "казино")),
+    Category("alerts", ("alert", "grafana", "zabbix", "prometheus", "noreply", "daemon")),
+    Category("urgent", ("urgent", "срочно", "критичн", "падает", "ошибка 500", "инцидент", "недоступен")),
+    Category("newsletters", ("дайджест", "newsletter", "рассылка", "новост")),
+    Category("hr_documents", ("отпуск", "больничный", "инструкция", "согласование", "договор", "заявление"))
 ]
 
 
-def setup_directories():
-    if not PROCESSED_DIR.exists():
-        PROCESSED_DIR.mkdir()
-    for cat in CATEGORIES:
-        (PROCESSED_DIR / cat).mkdir(exist_ok=True)
+def get_keywords(cat_name: str) -> tuple[str, ...]:
+    kw_str = os.getenv(f"{cat_name.upper()}_KEYWORDS")
+    if kw_str:
+        return tuple(kw.strip().lower() for kw in kw_str.split(',') if kw.strip())
+    default = next((c for c in DEFAULT_CATEGORIES if c.name == cat_name), None)
+    return default.keywords if default else ()
+
+
+def load_categories() -> list[Category]:
+    categories_str = os.getenv("CATEGORIES")
+    if not categories_str:
+        return DEFAULT_CATEGORIES
+
+    category_names = [c.strip() for c in categories_str.split(',') if c.strip()]
+    return [Category(name, get_keywords(name)) for name in category_names]
+
+
+ACTIVE_CATEGORIES = load_categories()
+
+CATEGORY_NAMES = [cat.name for cat in ACTIVE_CATEGORIES] + ["unknown", "errors"]
+
+
+def setup_directories(processed_dir):
+    if not processed_dir.exists():
+        processed_dir.mkdir()
+    for cat in CATEGORY_NAMES:
+        (processed_dir / cat).mkdir(exist_ok=True)
 
 
 def classify_letter(letter: Letter) -> str:
@@ -42,27 +67,11 @@ def classify_letter(letter: Letter) -> str:
     text = (letter.text or "").lower()
     sender = (letter.sent_from_email or "").lower()
 
+    search_text = f"{subject} {text} {sender}"
 
-
-    spam_keywords = ["casino", "win", "discount", "скидк", "выигрыш", "реклама", "казино"]
-    if any(keyword in subject or keyword in text for keyword in spam_keywords):
-        return "spam"
-
-    alert_keywords = ["alert", "grafana", "zabbix", "prometheus", "noreply", "daemon"]
-    if any(keyword in sender for keyword in alert_keywords):
-        return "alerts"
-
-    urgent_keywords = ["urgent", "срочно", "критичн", "падает", "ошибка 500", "инцидент", "недоступен"]
-    if any(keyword in subject or keyword in text for keyword in urgent_keywords):
-        return "urgent"
-
-    news_keywords = ["дайджест", "newsletter", "рассылка", "новост"]
-    if any(keyword in subject or keyword in text for keyword in news_keywords):
-        return "newsletters"
-
-    hr_keywords = ["отпуск", "больничный", "инструкция", "согласование", "договор", "заявление"]
-    if any(keyword in subject or keyword in text for keyword in hr_keywords):
-        return "hr_documents"
+    for category in ACTIVE_CATEGORIES:
+        if any(keyword in search_text for keyword in category.keywords):
+            return category.name
 
     return "unknown"
 
@@ -75,8 +84,9 @@ def check_empty(file_path: Path, content: list[str]) -> bool:
 
     return False
 
+
 def check_letter(file_path: Path, letter: Letter) -> bool:
-    if not letter.subject or not letter.text or not letter.sent_from_email or not letter.date:
+    if not letter.text or not letter.sent_from_email:
         logger.warning(f"Could not extract meaningful data from: {file_path}")
         logger.info(f"Classified {file_path} as errors")
         return True
@@ -84,66 +94,64 @@ def check_letter(file_path: Path, letter: Letter) -> bool:
 
 
 def classify_file(file_path: Path) -> str:
-    if file_path.suffix != ".txt":
-        logger.warning(f"Invalid file format: {file_path}")
-        logger.info(f"Classified {file_path} as errors")
-        return "errors"
     try:
+        if not isinstance(file_path, Path):
+            raise TypeError(f"{file_path} is not a Path")
+
+        if file_path.suffix != ".txt":
+            raise ValueError(f"Invalid file format: {file_path}")
+
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.readlines()
 
-        if check_empty(file_path, content):
-            return "errors"
-
-        letter = Letter(content)
-
-        if check_letter(file_path, letter):
+        if check_empty(file_path, content) or check_letter(file_path, letter := Letter(content)):
             return "errors"
 
         category = classify_letter(letter)
         logger.info(f"Classified {file_path} as {category}")
-
         return category
 
-    except IndexError:
-        logger.warning(f"Index error during parsing of {file_path}. Classified as errors")
-        return "errors"
+    except (TypeError, ValueError, IndexError) as e:
+        logger.warning(str(e))
 
     except Exception as e:
-        logger.warning(f"Error occurred {e} during {file_path} parsing. Classified as errors")
-        return "errors"
+        logger.warning(f"Error occurred {e} during {file_path} parsing.")
 
-def move_file(file_path: Path, category: str) -> None:
-    destination = PROCESSED_DIR / category / file_path.name
+    logger.info(f"Classified {file_path} as errors")
+    return "errors"
+
+
+def move_file(processed_dir: Path, file_path: Path, category: str) -> None:
+    destination = processed_dir / category / file_path.name
     try:
         shutil.move(str(file_path), str(destination))
     except Exception as e:
         logger.error(f"Failed to move file {file_path} to {destination}: {e}")
 
 
-
-def main():
-    if not INBOX_DIR.exists():
-        logger.error(f"Directory {INBOX_DIR} does not exist.")
-        print(f"Directory {INBOX_DIR} does not exist.")
+def main(input_dir: Path, output_dir: Path, n_jobs: int) -> None:
+    if not input_dir.exists():
+        logger.error(f"Directory {input_dir} does not exist.")
+        print(f"Directory {input_dir} does not exist.")
         return
 
-    setup_directories()
+    setup_directories(output_dir)
 
-    files = listdir(INBOX_DIR)
+    files = listdir(input_dir)
 
     logger.info("Starting email classification.")
 
-    file_paths = [INBOX_DIR / file_path for file_path in files]
+    file_paths = [input_dir / file_path for file_path in files]
 
-    categories = process_map(classify_file,file_paths , max_workers=N_JOBS, desc="Classifying letters")
+    categories = process_map(classify_file, file_paths, max_workers=n_jobs,
+                             desc="Classifying letters")
 
     stats = Counter(categories)
 
-    process_map(move_file, file_paths, categories, max_workers=N_JOBS, desc="Moving to folders")
+    process_map(move_file, [output_dir for _ in file_paths], file_paths, categories, max_workers=n_jobs,
+                desc="Moving to folders")
 
     logger.info("Classification finished.")
-
 
     with open("stats.json", "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=4, ensure_ascii=False)
@@ -154,7 +162,7 @@ def main():
         print(f"  {cat}: {count}")
 
 
-if __name__ == "__main__":
+def run_cli():
     parser = argparse.ArgumentParser(description="A simple CLI tool for email classification.")
     parser.add_argument("-i", "--input", type=str, default="inbox", help="Input folder")
     parser.add_argument("-o", "--output", type=str, default="processed", help="Output folder")
@@ -162,8 +170,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    input_dir = Path(args.input)
+    processed_dir = Path(args.output)
 
-    INBOX_DIR = Path(args.input)
-    PROCESSED_DIR = Path(args.output)
-    N_JOBS = args.jobs
-    main()
+    main(input_dir, processed_dir, args.jobs)
+
+
+if __name__ == "__main__":
+    run_cli()

@@ -7,5 +7,12 @@ dependencies = [
     "dateparser>=1.4.0",
     "joblib>=1.5.3",
     "pytest>=9.0.3",
+    "python-dotenv>=1.2.2",
     "tqdm>=4.67.3",
 ]
+
+[project.scripts]
+email-classifier = "classifier:run_cli"
+
+[tool.setuptools]
+py-modules = ["classifier", "structures"]
