@@ -1,0 +1,12 @@
+services:
+  mailpilot:
+    build: .
+    image: mailpilot:latest
+    container_name: mailpilot
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    # Для реальных DeepSeek / Coderun создайте backend/.env (см. backend/.env.example)
+    # и раскомментируйте строки ниже:
+    # env_file:
+    #   - backend/.env

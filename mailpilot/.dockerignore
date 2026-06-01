@@ -1,0 +1,11 @@
+# Не попадает в build-контекст образа
+**/node_modules
+**/dist
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.env
+**/server.log
+.git
+.gitignore

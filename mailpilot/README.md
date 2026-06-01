@@ -120,6 +120,51 @@ cd frontend && npm run dev
 
 ---
 
+## Docker и деплой
+
+Приложение упаковано в один образ (multi-stage: сборка фронта на Node → лёгкий
+Python-рантайм, который отдаёт и API, и собранный UI).
+
+### Через docker compose (рекомендуется)
+
+```bash
+cd mailpilot
+docker compose up --build -d
+```
+
+Откроется на http://localhost:8000. Остановить — `docker compose down`.
+
+### Через docker напрямую
+
+```bash
+cd mailpilot
+docker build -t mailpilot:latest .
+docker run -d --name mailpilot -p 8000:8000 mailpilot:latest
+```
+
+### Реальные ключи в контейнере
+
+Создайте `backend/.env` (по образцу `backend/.env.example`) и подключите его:
+
+```bash
+docker run -d -p 8000:8000 --env-file backend/.env mailpilot:latest
+```
+
+или раскомментируйте блок `env_file` в `docker-compose.yml`.
+
+### Деплой на сервер
+
+1. Скопировать `mailpilot/` на сервер (или склонировать репозиторий).
+2. Установить Docker и Docker Compose.
+3. `docker compose up --build -d` — образ соберётся на сервере.
+4. Перед контейнером поставить reverse-proxy (nginx/Caddy/Traefik) для домена и
+   HTTPS, проксируя на порт `8000`.
+
+Образ слушает порт 8000, работает от непривилегированного пользователя и имеет
+`HEALTHCHECK` на `/api/health`.
+
+---
+
 ## Подключение реальных DeepSeek и Coderun
 
 Приложение работает «из коробки» в mock-режиме. Чтобы включить реальные
