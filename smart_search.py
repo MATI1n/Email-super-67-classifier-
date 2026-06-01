@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
 
+SMALL_MODEL_PROMPT = """Extract sender data from a search query into JSON. Rules: 1. Name: nominative case, lowercase. 2. Email: lowercase or null. Format: {"name": "...", "email": "..."}. Examples: 'найди письмо от Елены Петровой про сайт' -> {"name": "елена петрова", "email": null}; 'поиск сообщений от ivan@mail.com' -> {"name": null, "email": "ivan@mail.com"}; 'письма от Mike' -> {"name": "mike", "email": null}; 'найди письмо от сергея на s.ivanov@test.ru' -> {"name": "сергей", "email": "s.ivanov@test.ru"}. Input: """
+
 embedder = SentenceTransformer("jinaai/jina-embeddings-v5-omni-nano", trust_remote_code=True,
                                model_kwargs={"default_task": "retrieval"})
 
@@ -23,7 +25,7 @@ client_qdrant = QdrantClient(
 def get_metadata(query: str) -> json:
     answer_from_small_model = client_llm.chat.completions.create(
             model=os.getenv("BASE_MODEL_URL"),
-            messages=[{"role": "system", "content": os.getenv("SMALL_MODEL_PROMPT")},
+            messages=[{"role": "system", "content": SMALL_MODEL_PROMPT},
                       {"role": "user", "content": query}],
             temperature=0
     )
@@ -69,6 +71,7 @@ def smart_search(query: str) -> str:
         limit=1,
         with_payload=True
     )
+    print(search_result.points[0].payload)
     relevant_email_name = search_result.points[0].payload.get("email_name")
     
     inbox = Path("inbox")
