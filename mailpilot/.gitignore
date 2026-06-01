@@ -14,3 +14,5 @@ frontend/.vite/
 
 # OS
 .DS_Store
+model_cache/
+

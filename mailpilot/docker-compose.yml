@@ -6,7 +6,10 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+    volumes:
+      - ./model_cache:/app/model_cache
     # Для реальных DeepSeek / Coderun создайте backend/.env (см. backend/.env.example)
     # и раскомментируйте строки ниже:
     # env_file:
     #   - backend/.env
+

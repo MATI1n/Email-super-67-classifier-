@@ -6,3 +6,4 @@ processed/
 classifier.log
 stats.json
 inbox/
+model_cache/
