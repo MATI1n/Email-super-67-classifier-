@@ -1,15 +1,27 @@
 services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
   mailpilot:
     build: .
     image: mailpilot:latest
     container_name: mailpilot
     ports:
       - "8000:8000"
-    restart: unless-stopped
     volumes:
       - ./model_cache:/app/model_cache
-    # Для реальных DeepSeek / Coderun создайте backend/.env (см. backend/.env.example)
-    # и раскомментируйте строки ниже:
-    # env_file:
-    #   - backend/.env
-
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+    env_file:
+      - backend/.env
+    depends_on:
+      - qdrant
+    restart: unless-stopped

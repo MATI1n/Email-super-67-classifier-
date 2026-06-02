@@ -1,7 +1,7 @@
 """Модуль умного поиска по почтовому ящику.
 
 Реализует гибридный поиск, объединяющий лексический канал (BM25) и
-семантический канал (векторная база данных Qdrant или Coderun с фолбэком на локальный хэш-эмбеддер).
+семантический канал на базе векторной БД Qdrant (эмбеддинги Jina v5).
 Результаты объединяются алгоритмом Reciprocal Rank Fusion (RRF).
 """
 from __future__ import annotations
@@ -10,6 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 import json
 import math
+import os
 import re
 from typing import Any, Dict, List, Set, Tuple
 
@@ -49,19 +50,6 @@ def tokenize(text: str) -> List[str]:
     ]
 
 
-def _char_trigrams(token: str) -> List[str]:
-    """Выделяет символьные триграммы из токена для устойчивости поиска.
-
-    Args:
-        token (str): Токен.
-
-    Returns:
-        List[str]: Список триграмм.
-    """
-    t = f"#{token}#"
-    return [t[i:i + 3] for i in range(len(t) - 2)]
-
-
 class BM25Channel:
     """Канал лексического поиска на основе алгоритма BM25."""
 
@@ -93,123 +81,6 @@ class BM25Channel:
         return [(i, float(s)) for i, s in ranked if s > 0][:top_k]
 
 
-# Размерность mock-эмбеддинга
-DIM: int = 2048
-
-
-def _embed(text: str) -> Dict[int, float]:
-    """Строит разреженный нормализованный mock-эмбеддинг на основе hashing.
-
-    Args:
-        text (str): Исходный текст.
-
-    Returns:
-        Dict[int, float]: Разреженный вектор (хэш -> вес).
-    """
-    vec: Dict[int, float] = defaultdict(float)
-    tokens = tokenize(text)
-    for tok in tokens:
-        vec[hash(("w", tok)) % DIM] += 1.0
-        for tri in _char_trigrams(tok):
-            vec[hash(("t", tri)) % DIM] += 0.5
-    norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
-    return {k: v / norm for k, v in vec.items()}
-
-
-def _cosine(a: Dict[int, float], b: Dict[int, float]) -> float:
-    """Вычисляет косинусное сходство между двумя разреженными векторами.
-
-    Args:
-        a (Dict[int, float]): Первый вектор.
-        b (Dict[int, float]): Второй вектор.
-
-    Returns:
-        float: Косинусное сходство.
-    """
-    if len(a) > len(b):
-        a, b = b, a
-    return sum(v * b.get(k, 0.0) for k, v in a.items())
-
-
-class _LocalVectorBackend:
-    """Локальное векторное хранилище в оперативной памяти (mock)."""
-
-    name: str = "local-mock"
-
-    def __init__(self) -> None:
-        self._vectors: Dict[str, Dict[int, float]] = {}
-
-    def index(self, doc_ids: List[str], docs: List[str]) -> None:
-        """Индексирует тексты документов локально.
-
-        Args:
-            doc_ids (List[str]): Список идентификаторов писем.
-            docs (List[str]): Список текстов писем.
-        """
-        self._vectors = {i: _embed(d) for i, d in zip(doc_ids, docs)}
-
-    def search(self, query: str, top_k: int) -> List[Tuple[str, float]]:
-        """Локальный векторный поиск по косинусному сходству.
-
-        Args:
-            query (str): Поисковый запрос.
-            top_k (int): Максимальное количество результатов.
-
-        Returns:
-            List[Tuple[str, float]]: Результаты поиска.
-        """
-        q = _embed(query)
-        scored = [(i, _cosine(q, v)) for i, v in self._vectors.items()]
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [(i, float(s)) for i, s in scored if s > 0][:top_k]
-
-
-class _CoderunBackend:
-    """Адаптер внешней векторной БД Coderun."""
-
-    name: str = "coderun"
-
-    def __init__(self) -> None:
-        self._base: str = settings.coderun_base_url.rstrip("/")
-        self._headers: Dict[str, str] = {"Authorization": f"Bearer {settings.coderun_api_key}"}
-        self._collection: str = settings.coderun_collection
-
-    def index(self, doc_ids: List[str], docs: List[str]) -> None:
-        """Загружает документы во внешнюю векторную БД Coderun.
-
-        Args:
-            doc_ids (List[str]): Идентификаторы.
-            docs (List[str]): Тексты.
-        """
-        payload = {"documents": [{"id": i, "text": d} for i, d in zip(doc_ids, docs)]}
-        with httpx.Client(timeout=settings.coderun_timeout) as client:
-            client.post(
-                f"{self._base}/collections/{self._collection}/upsert",
-                json=payload,
-                headers=self._headers,
-            )
-
-    def search(self, query: str, top_k: int) -> List[Tuple[str, float]]:
-        """Ищет похожие документы в Coderun.
-
-        Args:
-            query (str): Запрос.
-            top_k (int): Лимит.
-
-        Returns:
-            List[Tuple[str, float]]: Результаты.
-        """
-        with httpx.Client(timeout=settings.coderun_timeout) as client:
-            resp = client.post(
-                f"{self._base}/collections/{self._collection}/search",
-                json={"query": query, "top_k": top_k},
-                headers=self._headers,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        return [(hit["id"], float(hit.get("score", 0.0))) for hit in data.get("results", [])]
-
-
 class _QdrantBackend:
     """Адаптер векторной БД Qdrant.
 
@@ -226,7 +97,7 @@ class _QdrantBackend:
             store (MailStore): Ссылка на хранилище писем для получения метаданных.
         """
         self.store: Any = store
-        self._qdrant_url: str = "https://5579278d-b04b-4fbd-9539-a97af90de739.europe-west3-0.gcp.cloud.qdrant.io"
+        self._qdrant_url: str = f"http://{settings.qdrant_host}:{settings.qdrant_port}"
         self._qdrant_key: str = settings.qdrant_api_key
         self._collection: str = "email_classifier"
         self._client: Any = None
@@ -235,13 +106,32 @@ class _QdrantBackend:
     def _init_clients(self) -> None:
         """Инициализация клиентов Qdrant и SentenceTransformer."""
         if self._client is None:
-            self._client = QdrantClient(
-                location=self._qdrant_url,
-                api_key=self._qdrant_key
-            )
+            import time
+            start_time = time.time()
+            connected = False
+            client = None
+            while time.time() - start_time < 30:
+                try:
+                    client = QdrantClient(
+                        url=self._qdrant_url,
+                        api_key=self._qdrant_key if self._qdrant_key else None,
+                        timeout=5.0
+                    )
+                    client.get_collections()
+                    connected = True
+                    break
+                except Exception as e:
+                    print(f"Waiting for Qdrant at {self._qdrant_url}... Error: {e}")
+                    time.sleep(2)
+            if not connected:
+                print("Could not connect to Qdrant, trying one last time...")
+                client = QdrantClient(
+                    url=self._qdrant_url,
+                    api_key=self._qdrant_key if self._qdrant_key else None
+                )
+            self._client = client
         if self._embedder is None:
-            import os
-            # Possible paths to load from volume/local cache
+            # Определение локальных путей кэша моделей
             possible_paths = [
                 "/app/model_cache/jina-embeddings-v5-omni-nano",
                 "model_cache/jina-embeddings-v5-omni-nano",
@@ -260,7 +150,6 @@ class _QdrantBackend:
                 trust_remote_code=True,
                 model_kwargs={"default_task": "retrieval"}
             )
-
 
     def index(self, doc_ids: List[str], docs: List[str]) -> None:
         """Индексирует письма в Qdrant с генерацией эмбеддингов Jina.
@@ -314,7 +203,7 @@ class _QdrantBackend:
         )
 
     def _get_query_metadata(self, query: str) -> Dict[str, Any]:
-        """Извлекает метаданные (имя/email отправителя) из текстового запроса с помощью LLM.
+        """Извлекает метаданные (имя/email отправителя) из текстового запроса с помощью LLM OpenRouter.
 
         Args:
             query (str): Поисковый запрос.
@@ -322,16 +211,9 @@ class _QdrantBackend:
         Returns:
             Dict[str, Any]: Извлеченные данные в формате {"name": ..., "email": ...}.
         """
-        api_key = settings.openrouter_api_key_2 or settings.deepseek_api_key
-        base_url = "https://openrouter.ai/api/v1" if settings.openrouter_api_key_2 else settings.deepseek_base_url
-        model = settings.base_model_url or settings.deepseek_model
-
-        if not api_key:
-            return {"name": None, "email": None}
-
         client_llm = OpenAI(
-            base_url=base_url,
-            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+            api_key=settings.openrouter_api_key_2,
             timeout=30.0
         )
 
@@ -347,7 +229,7 @@ class _QdrantBackend:
 
         try:
             answer = client_llm.chat.completions.create(
-                model=model,
+                model=settings.base_model_url,
                 messages=[
                     {"role": "system", "content": small_model_prompt},
                     {"role": "user", "content": query}
@@ -430,22 +312,17 @@ class _QdrantBackend:
 
 
 class VectorChannel:
-    """Универсальный векторный канал, инкапсулирующий бэкенд (Qdrant, Coderun или Mock)."""
+    """Семантический векторный канал на базе Qdrant."""
 
     def __init__(self, store: Any, doc_ids: List[str], docs: List[str]) -> None:
-        """Инициализирует канал и строит векторный индекс.
+        """Инициализирует канал и строит векторный индекс в Qdrant.
 
         Args:
             store (MailStore): Хранилище писем.
             doc_ids (List[str]): Список идентификаторов писем.
             docs (List[str]): Список текстов писем.
         """
-        if settings.qdrant_enabled:
-            self.backend: Any = _QdrantBackend(store)
-        elif settings.vector_remote:
-            self.backend = _CoderunBackend()
-        else:
-            self.backend = _LocalVectorBackend()
+        self.backend: Any = _QdrantBackend(store)
         self.backend.index(doc_ids, docs)
 
     @property
@@ -475,7 +352,7 @@ class SearchHit:
 
 
 class HybridSearch:
-    """Основной класс гибридного поиска по почтовому ящику (BM25 + Векторы + RRF)."""
+    """Основной класс гибридного поиска по почтовому ящику (BM25 + Qdrant + RRF)."""
 
     def __init__(self, store: Any) -> None:
         """Инициализирует и индексирует все письма из хранилища.

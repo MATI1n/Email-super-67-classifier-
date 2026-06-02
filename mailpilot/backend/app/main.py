@@ -1,13 +1,13 @@
 """FastAPI-приложение MailPilot.
 
-Предоставляет REST API для веб-интерфейса почтового клиента (обработка писем,
-суммаризация, гибридный поиск, аналитика) и раздает собранные файлы фронтенда.
+Отдаёт REST API почтового клиента и (если собран) статический фронтенд.
 """
 from __future__ import annotations
 
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,39 +18,32 @@ from .ai import summarizer, summary_to_dict
 from .classifier import TAG_BY_ID
 from .config import settings
 from .search import HybridSearch, tokenize
-from .store import MailStore
-
+from .store import CATEGORY_LABELS, MailStore
 
 # --------------------------------------------------------------------------- #
-# Состояние приложения (хранилище + поисковый индекс)
+# Состояние приложения (хранилище + поисковый индекс).
 # --------------------------------------------------------------------------- #
 class AppState:
-    """Класс для хранения и пересборки глобального состояния приложения."""
+    store: Optional[MailStore] = None
+    search: Optional[HybridSearch] = None
 
-    def __init__(self) -> None:
-        self.store: Optional[MailStore] = None
-        self.search: Optional[HybridSearch] = None
-
-    def rebuild(self) -> None:
-        """Перезагружает письма с диска и переиндексирует их для поиска."""
+    def rebuild(self):
         self.store = MailStore(settings.data_dir)
         self.store.load()
         self.search = HybridSearch(self.store)
 
 
-state: AppState = AppState()
+state = AppState()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Управление жизненным циклом FastAPI приложения (инициализация при старте)."""
     state.rebuild()
     yield
 
 
-app: FastAPI = FastAPI(title="MailPilot API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="MailPilot API", version="1.0.0", lifespan=lifespan)
 
-# Настройка CORS для локальной разработки
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -60,34 +53,22 @@ app.add_middleware(
 
 
 # --------------------------------------------------------------------------- #
-# Схемы запросов Pydantic
+# Схемы запросов
 # --------------------------------------------------------------------------- #
 class ActionRequest(BaseModel):
-    """Схема запроса для выполнения действий над письмами."""
     action: str  # read | unread | star | unstar | archive | unarchive | delete | restore
 
 
 class SummarizeRequest(BaseModel):
-    """Схема запроса на суммаризацию письма."""
     scope: str = "email"  # email | ticket
 
 
 class TagsRequest(BaseModel):
-    """Схема запроса для изменения списка тегов письма."""
     tags: List[str]
 
 
 def _make_snippet(body: str, query: str, width: int = 160) -> str:
-    """Генерирует короткий текстовый сниппет вокруг совпадений ключевых слов.
-
-    Args:
-        body (str): Текст письма.
-        query (str): Поисковый запрос.
-        width (int): Максимальная длина сниппета.
-
-    Returns:
-        str: Подготовленный сниппет с многоточием.
-    """
+    """Сниппет вокруг первого совпадения слова запроса (для подсветки)."""
     terms = tokenize(query)
     low = body.lower()
     pos = -1
@@ -113,23 +94,20 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "emails_loaded": state.store.counts()["total"] if state.store else 0,
-        "ai_mode": "openrouter" if settings.openrouter_enabled else ("deepseek" if settings.ai_enabled else "mock"),
-        "vector_mode": state.search.vector_mode if state.search else "n/a",
+        "ai_mode": "openrouter",
+        "vector_mode": "qdrant",
     }
 
 
 @app.post("/api/reset")
-def reset() -> Dict[str, Any]:
-    """Перезагружает базу писем с диска (полезно для сброса демо-данных)."""
+def reset():
+    """Перезагрузить датасет (удобно для демо)."""
     state.rebuild()
-    return {"status": "reloaded", "total": state.store.counts()["total"] if state.store else 0}
+    return {"status": "reloaded", "total": state.store.counts()["total"]}
 
 
 @app.get("/api/folders")
-def folders() -> Dict[str, Any]:
-    """Возвращает информацию о структуре папок и количестве писем в них."""
-    if not state.store:
-        raise HTTPException(status_code=500, detail="Mail store is not initialized")
+def folders():
     return state.store.counts()
 
 
@@ -143,79 +121,35 @@ def list_emails(
     tag: Optional[str] = None,
     unread: bool = False,
     starred: bool = False,
-    sort: str = "date",
-) -> Dict[str, Any]:
-    """Возвращает отфильтрованный и отсортированный список писем.
-
-    Args:
-        folder (str): Папка ("inbox", "sent", "archive" и т.д.).
-        category (Optional[str]): Фильтр по категории.
-        tag (Optional[str]): Фильтр по тегу.
-        unread (bool): Только непрочитанные.
-        starred (bool): Только помеченные звездочкой.
-        sort (str): Тип сортировки ("date" или "priority").
-
-    Returns:
-        Dict[str, Any]: Список писем и их общее количество.
-    """
-    if not state.store:
-        raise HTTPException(status_code=500, detail="Mail store is not initialized")
+    sort: str = "date",  # date | priority
+):
     if tag and tag not in TAG_BY_ID:
-        raise HTTPException(status_code=400, detail=f"Неизвестный тег: {tag}")
-
+        raise HTTPException(400, f"Неизвестный тег: {tag}")
     items = state.store.query(
-        folder=folder,
-        category=category,
-        tag=tag,
-        unread_only=unread,
-        starred_only=starred,
+        folder=folder, category=category, tag=tag,
+        unread_only=unread, starred_only=starred,
     )
-
     if sort == "priority":
         rank = {"high": 0, "normal": 1, "low": 2}
         items = sorted(items, key=lambda e: (rank.get(e.priority, 1), -e.received_at.timestamp()))
-
     return {"items": [e.to_list_item() for e in items], "total": len(items)}
 
 
 @app.get("/api/emails/{mail_id}")
-def get_email(mail_id: str, mark_read: bool = True) -> Dict[str, Any]:
-    """Возвращает детальную информацию о конкретном письме.
-
-    Args:
-        mail_id (str): Идентификатор письма.
-        mark_read (bool): Помечать ли письмо прочитанным при открытии.
-
-    Returns:
-        Dict[str, Any]: Детальная информация о письме.
-    """
-    if not state.store:
-        raise HTTPException(status_code=500, detail="Mail store is not initialized")
+def get_email(mail_id: str, mark_read: bool = True):
     email = state.store.get(mail_id)
     if not email:
-        raise HTTPException(status_code=404, detail="Письмо не найдено")
+        raise HTTPException(404, "Письмо не найдено")
     if mark_read:
         state.store.mark_read(mail_id, True)
     return email.to_detail()
 
 
 @app.post("/api/emails/{mail_id}/action")
-def email_action(mail_id: str, req: ActionRequest) -> Dict[str, Any]:
-    """Выполняет стандартные операции с письмом (архивация, удаление, прочтение).
-
-    Args:
-        mail_id (str): Идентификатор письма.
-        req (ActionRequest): Параметры действия.
-
-    Returns:
-        Dict[str, Any]: Обновленное состояние письма в списке.
-    """
+def email_action(mail_id: str, req: ActionRequest):
     s = state.store
-    if not s:
-        raise HTTPException(status_code=500, detail="Mail store is not initialized")
     if not s.get(mail_id):
-        raise HTTPException(status_code=404, detail="Письмо не найдено")
-
+        raise HTTPException(404, "Письмо не найдено")
     a = req.action
     handlers = {
         "read": lambda: s.mark_read(mail_id, True),
@@ -227,57 +161,31 @@ def email_action(mail_id: str, req: ActionRequest) -> Dict[str, Any]:
         "delete": lambda: s.delete(mail_id, True),
         "restore": lambda: s.delete(mail_id, False),
     }
-
     if a not in handlers:
-        raise HTTPException(status_code=400, detail=f"Неизвестное действие: {a}")
-
+        raise HTTPException(400, f"Неизвестное действие: {a}")
     email = handlers[a]()
     return email.to_list_item()
 
 
 @app.put("/api/emails/{mail_id}/tags")
-def set_tags(mail_id: str, req: TagsRequest) -> Dict[str, Any]:
-    """Изменяет теги письма.
-
-    Args:
-        mail_id (str): Идентификатор письма.
-        req (TagsRequest): Запрашиваемый список тегов.
-
-    Returns:
-        Dict[str, Any]: Обновленное состояние письма.
-    """
-    if not state.store:
-        raise HTTPException(status_code=500, detail="Mail store is not initialized")
+def set_tags(mail_id: str, req: TagsRequest):
     unknown = [t for t in req.tags if t not in TAG_BY_ID]
     if unknown:
-        raise HTTPException(status_code=400, detail=f"Неизвестные теги: {unknown}")
-
+        raise HTTPException(400, f"Неизвестные теги: {unknown}")
     email = state.store.set_tags(mail_id, req.tags)
     if not email:
-        raise HTTPException(status_code=404, detail="Письмо не найдено")
+        raise HTTPException(404, "Письмо не найдено")
     return email.to_list_item()
 
 
 # --------------------------------------------------------------------------- #
-# AI-суммаризация
+# AI-суммаризация (письмо / заявка)
 # --------------------------------------------------------------------------- #
 @app.post("/api/emails/{mail_id}/summarize")
-def summarize(mail_id: str, req: SummarizeRequest = SummarizeRequest()) -> Dict[str, Any]:
-    """Создает интеллектуальную сводку по письму через LLM.
-
-    Args:
-        mail_id (str): Идентификатор письма.
-        req (SummarizeRequest): Параметры масштаба сводки (только письмо или вся заявка).
-
-    Returns:
-        Dict[str, Any]: Результат суммаризации от LLM.
-    """
-    if not state.store:
-        raise HTTPException(status_code=500, detail="Mail store is not initialized")
+def summarize(mail_id: str, req: SummarizeRequest = SummarizeRequest()):
     email = state.store.get(mail_id)
     if not email:
-        raise HTTPException(status_code=404, detail="Письмо не найдено")
-
+        raise HTTPException(404, "Письмо не найдено")
     s = summarizer.summarize(email.subject, email.body, email.category, email.tags)
     result = summary_to_dict(s)
     result["scope"] = req.scope
@@ -289,20 +197,8 @@ def summarize(mail_id: str, req: SummarizeRequest = SummarizeRequest()) -> Dict[
 # Умный поиск (гибридный: BM25 + семантика)
 # --------------------------------------------------------------------------- #
 @app.get("/api/search")
-def search(q: str = Query(..., min_length=1), top_k: int = 20) -> Dict[str, Any]:
-    """Выполняет гибридный лексико-семантический поиск.
-
-    Args:
-        q (str): Поисковый запрос.
-        top_k (int): Максимальное число возвращаемых результатов.
-
-    Returns:
-        Dict[str, Any]: Результаты поиска, информация о векторном режиме и количество.
-    """
-    if not state.search or not state.store:
-        raise HTTPException(status_code=500, detail="Search index is not initialized")
-
-    hits = state.search.search(q, top_k=top_k)
+def search(q: str = Query(..., min_length=1), top_k: int = 3):
+    hits = state.search.search(q, top_k=top_k + 10)  # Запрашиваем с запасом на случай удаленных
     results = []
     for h in hits:
         email = state.store.get(h.doc_id)
@@ -313,7 +209,8 @@ def search(q: str = Query(..., min_length=1), top_k: int = 20) -> Dict[str, Any]
         item["channels"] = h.channels
         item["match_snippet"] = _make_snippet(email.body, q)
         results.append(item)
-
+        if len(results) >= top_k:
+            break
     return {
         "query": q,
         "vector_mode": state.search.vector_mode,
@@ -326,10 +223,7 @@ def search(q: str = Query(..., min_length=1), top_k: int = 20) -> Dict[str, Any]
 # Лёгкая аналитика (для дашборда)
 # --------------------------------------------------------------------------- #
 @app.get("/api/stats")
-def stats() -> Dict[str, Any]:
-    """Возвращает агрегированную статистику по письмам для дашборда аналитики."""
-    if not state.store:
-        raise HTTPException(status_code=500, detail="Mail store is not initialized")
+def stats():
     c = state.store.counts()
     active = [e for e in state.store.all() if not e.deleted]
     return {
@@ -343,15 +237,14 @@ def stats() -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Отдача собранного фронтенда
+# Отдача собранного фронтенда (если есть frontend/dist).
 # --------------------------------------------------------------------------- #
-_dist: Path = Path(settings.frontend_dist)
+_dist = Path(settings.frontend_dist)
 if _dist.exists() and (_dist / "index.html").exists():
     app.mount("/", StaticFiles(directory=str(_dist), html=True), name="frontend")
 else:
     @app.get("/")
-    def root() -> Dict[str, str]:
-        """Возвращает информацию-заглушку в случае, если фронтенд не собран."""
+    def root():
         return {
             "app": "MailPilot API",
             "docs": "/docs",

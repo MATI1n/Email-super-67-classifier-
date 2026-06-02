@@ -7,3 +7,4 @@ classifier.log
 stats.json
 inbox/
 model_cache/
+qdrant_data/

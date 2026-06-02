@@ -15,4 +15,5 @@ frontend/.vite/
 # OS
 .DS_Store
 model_cache/
+qdrant_data/
 
